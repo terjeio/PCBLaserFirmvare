@@ -9,3 +9,4 @@ It is possible to have a drill-ready PCB with solder mask in just two hours from
 
 Further information and some images can be found over at [43oh.com](http://forum.43oh.com/topic/9645-pcb-laser-exposerprinter/#comment-72756)
 
+Project can now be directly imported into TI's cloud based IDE [dev.ti.com](https://dev.ti.com)
