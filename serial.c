@@ -1,13 +1,13 @@
 //
 // serial.c - serial (UART) port library including MCP4725 DAC support, for PCB laser
 //
-// v1.0 / 2016-06-03 / Io Engineering / Terje
+// v1.5 / 2018-07-01 / Io Engineering / Terje
 //
 //
 
 /*
 
-Copyright (c) 2015, Terje Io
+Copyright (c) 2015-2018, Terje Io
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without modification,
@@ -39,6 +39,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <msp430.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "serial.h"
 
@@ -48,280 +49,375 @@ char txbuf[TX_BUFFER_SIZE];
 char rxbuf[RX_BUFFER_SIZE];
 
 const char eol[] = "\r\n";
-static volatile unsigned int tx_head = 0, tx_tail = 0, rx_head = 0, rx_tail = 0, rx_overflow = 0;
+static volatile uint16_t tx_head = 0, tx_tail = 0, rx_head = 0, rx_tail = 0, rx_overflow = 0;
 
 #ifdef XONXOFF
-	static volatile unsigned int rx_off = XONOK;
+    static volatile unsigned int rx_off = XONOK;
 #endif
 
-void setUCA0BR (int prescaler) {
-	UCA0BR0 = prescaler & 0xFF; // LSB
-	UCA0BR1 = prescaler >> 8;	// MSB
+inline static void setUARTBR (int prescaler)
+{
+    SERIAL_BR0 = prescaler & 0xFF;  // LSB
+    SERIAL_BR1 = prescaler >> 8;    // MSB
 }
 
-void serialInit(void) {
+void serialInit (void)
+{
+    SERIAL_SEL  |= RXD|TXD;         // P1.1 = RXD, P1.2=TXD
+#ifdef SERIAL_SEL2
+    SERIAL_SEL2 |= RXD|TXD;         // P1.1 = RXD, P1.2=TXD
+#endif
+    SERIAL_CTL1 = UCSWRST;
+    SERIAL_CTL1 |= UCSSEL_2;        // Use SMCLK
 
-	P1SEL  |= RXD|TXD; 	// P1.1 = RXD, P1.2=TXD
-	P1SEL2 |= RXD|TXD; 	// P1.1 = RXD, P1.2=TXD
+#ifdef __MSP430F5310__
+    setUARTBR(656);                 // Set baudrate to 38400 @ 25MHz SMCLK
+    SERIAL_MCTL = 0;                // Modulation UCBRSx=0, UCBRFx=0
+#else
+    setUARTBR(26);                  // Set baudrate to 38400
+    SERIAL_MCTL = UCBRF0|UCOS16;    // with oversampling
+#endif
 
-	UCA0CTL1 = UCSWRST;
-	UCA0CTL1 |= UCSSEL_2; 	// Use SMCLK
-
-/*	setUCA0BR(138); 			// Set baud rate to 115200 with 1MHz clock (Data Sheet 15.3.13)
-	UCA0MCTL = UCBRS0+UCBRS1+UCBRS2; 		// Modulation UCBRSx = 1
-*/
-	setUCA0BR(26);				// Set baudrate to 38400
-	UCA0MCTL = UCBRF0|UCOS16; 	// with oversampling
-
-	UCA0CTL0 = 0;
-	UCA0CTL1 &= ~UCSWRST; 	// Initialize USCI state machine
-	IE2 |= UCA0RXIE; 		// Enable USCI_A0 RX interrupt
+    SERIAL_CTL0 = 0;
+    SERIAL_CTL1 &= ~UCSWRST;        // Initialize USCI state machine
+    SERIAL_IE |= SERIAL_RXIE;       // Enable USCI_A0 RX interrupt
 
 #ifndef XONXOFF
-	P1DIR |= RTS;			// Enable RTS pin
-	P1OUT &= ~RTS;			// and drive it low
+    RTS_PORT_DIR |= RTS_BIT;        // Enable RTS pin as output
+    RTS_PORT_OUT &= ~RTS_BIT;       // and drive it low
 #endif
-
 }
 
-unsigned int serialTxCount(void)
+uint16_t serialTxCount (void)
 {
-  unsigned int tail = tx_tail;
+  uint16_t tail = tx_tail;
   return BUFCOUNT(tx_head, tail, TX_BUFFER_SIZE);
 }
 
-unsigned int serialRxCount(void)
+uint16_t serialRxCount (void)
 {
-  unsigned int tail = rx_tail, head = rx_head;
+  uint16_t tail = rx_tail, head = rx_head;
   return BUFCOUNT(head, tail, RX_BUFFER_SIZE);
 }
 
-void serialRxFlush(void)
+void serialRxFlush (void)
 {
-	rx_head = 0;
-	rx_tail = 0;
-	P1OUT &= ~RTS;
+    rx_head = 0;
+    rx_tail = 0;
+    RTS_PORT_OUT &= ~RTS_BIT;
 }
 
-void serialPutC(const char data) {
+void serialPutC (const char c)
+{
+    uint16_t next_head = tx_head;
 
-	unsigned int next_head = tx_head + 1;
+    if((SERIAL_IFG & SERIAL_TXIE) && next_head == tx_tail)  // If no data pending in buffers
+        SERIAL_TXD = c;                                     // send character immediately
 
-	if (next_head == TX_BUFFER_SIZE)
-		next_head = 0;
+    else {
 
-	while(tx_tail == next_head); 	// Buffer full, block until free room
+        if (++next_head == TX_BUFFER_SIZE)  // Wrap buffer index
+            next_head = 0;                  // if at end
 
- 	txbuf[tx_head] = data;			// Enter data into buffer
-	tx_head = next_head;			// and increment pointer to next entry
+        while(tx_tail == next_head);        // Buffer full, block until free room
 
-	UC0IE |= UCA0TXIE;				// Enable transmit interrupts
+        txbuf[tx_head] = c;                 // Enter data into buffer
+        tx_head = next_head;                // and increment pointer to next entry
 
+        SERIAL_IE |= SERIAL_TXIE;           // Enable transmit interrupts
+    }
 }
 
-char serialRead(void) {
+char serialRead (void)
+{
+    uint16_t c, tail;
 
-	unsigned int data, tail;
-
-	_DINT();                                				// Disable interrupts (to avoid contention)
-
-	tail = rx_tail;
-	data = tail != rx_head ? rxbuf[tail++] : EOF; 			// Get next character and increment pointer if data available else EOF
-	rx_tail = tail == RX_BUFFER_SIZE ? 0 : tail;   			// then update pointer
+    tail = rx_tail;
+    c = tail != rx_head ? rxbuf[tail++] : EOF;      // Get next character and increment pointer if data available else EOF
+    rx_tail = tail == RX_BUFFER_SIZE ? 0 : tail;    // then update pointer
 
 #ifdef XONXOFF
     if (rx_off == XOFFOK && BUFCOUNT(rx_head, rx_tail, RX_BUFFER_SIZE) < RX_BUFFER_LWM) {
-    	rx_off = XON;										// Queue XON at front
-    	UC0IE |= UCA0TXIE; 									// and enable UART TX interrupt
+        rx_off = XON;                               // Queue XON at front
+        UC0IE |= SERIAL_TXIE;                       // and enable UART TX interrupt
     }
 #else
 
-    if ((P1IN & RTS) && BUFCOUNT(rx_head, rx_tail, RX_BUFFER_SIZE) < RX_BUFFER_LWM)	// Clear RTS if
-    	P1OUT &= ~RTS;										// buffer count is below low water mark
-
-    _EINT();                                				// Reenable interrupts
+    if ((RTS_PORT_IN & RTS_BIT) && BUFCOUNT(rx_head, rx_tail, RX_BUFFER_SIZE) < RX_BUFFER_LWM)  // Clear RTS if
+        RTS_PORT_OUT &= ~RTS_BIT;                                                               // buffer count is below low water mark
 
 #endif
 
-    return data;
+    return c;
 }
 
-void serialWriteS(const char *data) {
+void serialWriteS (const char *data)
+{
+    char c, *ptr = (char *)data;
 
-	char c, *ptr = (char *)data;
-
-	while((c = *ptr++) != '\0')
-		serialPutC(c);
-
+    while((c = *ptr++) != '\0')
+        serialPutC(c);
 }
 
-void serialWriteLn(const char *data) {
-	serialWriteS(data);
-	serialWriteS(eol);
+void serialWriteLn (const char *data)
+{
+    serialWriteS(data);
+    serialWriteS(eol);
 }
 
-void serialWrite(const char *data, unsigned int length) {
+void serialWrite (const char *data, uint16_t length)
+{
+    char *ptr = (char *)data;
 
-	char *ptr = (char *)data;
-
-	while(length--)
-		serialPutC(*ptr++);
-
+    while(length--)
+        serialPutC(*ptr++);
 }
+
+#ifdef HAS_DAC
 
 /* MCP 4725 libray functions */
 
-#define SDC BIT6
-#define SDA BIT7
+static uint8_t TXBuffer[3];         // Transmit buffer
+static uint8_t *pTXBuffer;          // Pointer to TX buffer
+static volatile uint8_t TXCount;    // Bytes to send
 
-unsigned static char TXBuffer[3];			// Transmit buffer
-unsigned static char *pTXBuffer;			// Pointer to TX buffer
-unsigned static char TXCount;				// Bytes to send
+void setVoltage (uint16_t value, bool writeEEPROM)
+{
+    TXBuffer[0] = writeEEPROM ? MCP4725_WRITEEEPROM : MCP4725_WRITE;    // DAC command
+    TXBuffer[1] = (value & 0xFF0) >> 4;                                 // MSB data
+    TXBuffer[2] = (value & 0x00F) << 4;                                 // LSB data
 
-void setVoltage (unsigned int value, bool writeEEPROM) {
+    pTXBuffer = TXBuffer;               // TX buffer start address
+    TXCount = 3;                        // Bytes to transmit
 
-	unsigned int stat = UCB0CTL1 & UCTXSTP;
+    while (I2C_CTL1 & UCTXSTP);         // Ensure stop condition got sent
 
-	TXBuffer[0] = writeEEPROM ? MCP4725_WRITEEEPROM : MCP4725_WRITE; 	// DAC command
-	TXBuffer[1] = (value & 0xFF0) >> 4;						    	   	// MSB data
-	TXBuffer[2] = (value & 0x00F) << 4;									// LSB data
+    I2C_CTL1 |= UCTR|UCTXSTT;           // I2C TX, start condition
 
-	pTXBuffer = (unsigned char *)TXBuffer;  // TX buffer start address
-	TXCount = 3;              				// Bytes to transmit
+    LPM0;                               // Stay in LPM until finished
+}
 
-	while (UCB0CTL1 & UCTXSTP);             // Ensure stop condition got sent
+void resetDAC (void)
+{
+    TXBuffer[0] = 0x06;
 
-    UCB0CTL1 |= UCTR + UCTXSTT;             // I2C TX, start condition
+    pTXBuffer = TXBuffer;               // TX buffer start address
+    TXCount = 1;                        // Bytes to transmit
 
-    while(TXCount)							// While data to send
-    	LPM0;        						// enter LPM until finished
+    while (I2C_CTL1 & UCTXSTP);         // Ensure stop condition got sent
+
+    I2C_CTL1 |= UCTR|UCTXSTT;           // I2C TX, start condition
+
+    LPM0;                               // Enter LPM0
+}
+
+void wakeUpDAC (void)
+{
+    TXBuffer[0] = 0x09;
+
+    pTXBuffer = (uint8_t *)TXBuffer;    // TX buffer start address
+    TXCount = 1;                        // Bytes to transmit
+
+    while (I2C_CTL1 & UCTXSTP);         // Ensure stop condition got sent
+
+    I2C_CTL1 |= UCTR|UCTXSTT;           // I2C TX, start condition
+
+    LPM0;                               // Enter LPM0
+}
+
+void initDAC (void)
+{
+    I2C_SEL  |= SDC|SDA;                // Assign I2C pins to USCI_B0
+#ifdef I2C_SEL2
+    I2C_SEL2 |= SDC|SDA;                // Assign I2C pins to USCI_B0
+#endif
+    I2C_CTL1 |= UCSWRST;                // Enable SW reset
+    I2C_CTL0 = UCMST|UCMODE_3|UCSYNC;   // I2C Master, synchronous mode
+    I2C_CTL1 = UCSSEL_2|UCSWRST;        // Use SMCLK, keep SW reset
+#ifdef __MSP430F5310__
+    I2C_BR0 = 250;                      // fSCL = 100kHz
+#else
+    I2C_BR0 = 160;                      // fSCL = 100kHz
+#endif
+    I2C_BR1 = 0;
+    I2C_CSA = 0x00;                     // Slave Address 0 for General Call
+    I2C_CTL1 &= ~UCSWRST;               // Clear SW reset, resume operation
+    I2C_IE |= SERIAL_TXIE;              // Enable TX interrupt
+
+    resetDAC();                         // Reset
+    wakeUpDAC();                        // and wakeup DAC
+
+    while (I2C_CTL1 & UCTXSTP);         // Ensure stop condition got sent
+
+    I2C_CSA = 0x60;                     // Slave Address is 048h
+}
+
+#endif
+
+#ifdef __MSP430F5310__
+
+#pragma vector=USCI_A1_VECTOR
+__interrupt void USCI1RX_ISR(void)
+{
+    uint16_t iv = UCA1IV;
+
+    if(iv == 0x02) {
+
+        uint16_t next_head = rx_head + 1;       // Get and increment buffer pointer
+
+        if (next_head == RX_BUFFER_SIZE)        // If at end
+            next_head = 0;                      // wrap pointer around
+
+        if(rx_tail == next_head) {              // If buffer full
+            rx_overflow = 1;                    // flag overlow
+            next_head = SERIAL_RXD;             // and do dummy read to clear interrupt
+        } else {
+            rxbuf[rx_head] = SERIAL_RXD;        // Add data to buffer
+            rx_head = next_head;                // and update pointer
+    #ifdef XONXOFF
+            if (rx_off == XONOK && BUFCOUNT(rx_head, rx_tail, RX_BUFFER_SIZE) > RX_BUFFER_HWM) {
+                rx_off = XOFF;                  // Queue XOFF at front
+                UC0IE |= UCA1TXIE;              // and enable UART TX interrupt
+            }
+    #else
+            if (!(RTS_PORT_IN & RTS_BIT) && BUFCOUNT(rx_head, rx_tail, RX_BUFFER_SIZE) >= RX_BUFFER_HWM) {
+
+                RTS_PORT_OUT |= RTS_BIT;
+                tx_head = tx_tail;
+            }
+    #endif
+        }
+    }
+
+    if(iv == 0x04) {
+
+        uint16_t tail = tx_tail;                // Get buffer pointer
+
+    #ifdef XONXOFF
+        if(rx_off == XON || rx_off == XOFF) {   // If we have XOFF/XON to send
+            SERIAL_TXD = rx_off;                // send it
+            rx_off |= 0x80;                     // and flag it sent
+        } else {
+    #endif
+            SERIAL_TXD = txbuf[tail++];         // Send next character and increment pointer
+
+            if(tail == TX_BUFFER_SIZE)          // If at end
+                tail = 0;                       // wrap pointer around
+
+            tx_tail = tail;                     // Update global pointer
+    #ifdef XONXOFF
+        }
+    #endif
+        if(tail == tx_head)                     // If buffer empty then
+            SERIAL_IE &= ~SERIAL_TXIE;          // disable UART TX interrupt
+    }
 
 }
 
-void resetDAC (void) {
-
-	TXBuffer[0] = 0x06;
-
-	pTXBuffer = (unsigned char *)TXBuffer;  // TX buffer start address
-	TXCount = 1;              				// Bytes to transmit
-
-	while (UCB0CTL1 & UCTXSTP);             // Ensure stop condition got sent
-
-    UCB0CTL1 |= UCTR + UCTXSTT;             // I2C TX, start condition
-
-    LPM0;        							// Enter LPM0
-
+#pragma vector=USCI_B1_VECTOR
+__interrupt void USCIB1_ISR(void)
+{
+    switch(__even_in_range(UCB1IV, 12)) {
+        case  0: break;                         // Vector  0: No interrupts
+        case  2: break;                         // Vector  2: ALIFG
+        case  4:                                // Vector  4: NACKIFG
+            if(I2C_STAT & UCNACKIFG) {
+                I2C_STAT &= ~UCNACKIFG;
+                I2C_CTL1 |= UCTXSTP;            // I2C stop condition
+                LPM0_EXIT;                      // Exit LPM0
+            }
+            break;
+        case  6: break;                         // Vector  6: STTIFG
+        case  8: break;                         // Vector  8: STPIFG
+        case 10: break;                         // Vector 10: RXIFG
+        case 12: // Vector 12: TXIFG
+            if(TXCount) {                       // Still data to send?
+                I2C_TXD = *pTXBuffer++;         // Yep, load TX buffer and
+                TXCount--;                      // decrement TX byte counter
+            } else {
+                I2C_CTL1 |= UCTXSTP;            // Send I2C stop condition and
+                I2C_IFG &= ~SERIAL_TXIFG;       // clear TX int flag
+                LPM0_EXIT;                      // Exit LPM0
+            }
+            break;
+        default: break;
+    }
 }
 
-void wakeUpDAC (void) {
-
-	TXBuffer[0] = 0x09;
-
-	pTXBuffer = (unsigned char *)TXBuffer;  // TX buffer start address
-	TXCount = 1;              				// Bytes to transmit
-
-	while (UCB0CTL1 & UCTXSTP);             // Ensure stop condition got sent
-
-    UCB0CTL1 |= UCTR + UCTXSTT;             // I2C TX, start condition
-
-    LPM0;        							// Enter LPM0
-
-}
-
-void initDAC (void) {
-
-	P1SEL  |= SDC|SDA;                     	// Assign I2C pins to USCI_B0
-	P1SEL2 |= SDC|SDA;                     	// Assign I2C pins to USCI_B0
-	UCB0CTL1 |= UCSWRST;                    // Enable SW reset
-	UCB0CTL0 = UCMST + UCMODE_3 + UCSYNC;   // I2C Master, synchronous mode
-	UCB0CTL1 = UCSSEL_2 + UCSWRST;          // Use SMCLK, keep SW reset
-	UCB0BR0 = 160;                          // fSCL = SMCLK/3 = ~333kHz
-	UCB0BR1 = 0;
-	UCB0I2CSA = 0x00;                       // Slave Address 0 for General Call
-	UCB0CTL1 &= ~UCSWRST;                   // Clear SW reset, resume operation
-	IE2 |= UCB0TXIE;                        // Enable TX interrupt
-
-	resetDAC();								// Reset
-	wakeUpDAC();							// and wakeup DAC
-
-	while (UCB0CTL1 & UCTXSTP);             // Ensure stop condition got sent
-
-	UCB0I2CSA = 0x60;                       // Slave Address is 048h
-}
-
+#else
 
 #pragma vector=USCIAB0RX_VECTOR
 __interrupt void USCI0RX_ISR(void)
 {
+    uint16_t next_head = rx_head + 1;       // Get and increment buffer pointer
 
-	unsigned int next_head = rx_head + 1;	// Get and increment buffer pointer
+    if (next_head == RX_BUFFER_SIZE)        // If at end
+        next_head = 0;                      // wrap pointer around
 
-	if (next_head == RX_BUFFER_SIZE)		// If at end
-		next_head = 0;						// wrap pointer around
-
-	if(rx_tail == next_head) {				// If buffer full
-		rx_overflow = 1;					// flag overlow
-		next_head = UCA0RXBUF; 				// and do dummy read to clear interrupt
-	} else {
-		rxbuf[rx_head] = UCA0RXBUF;			// Add data to buffer
-		rx_head = next_head;				// and update pointer
+    if(rx_tail == next_head) {              // If buffer full
+        rx_overflow = 1;                    // flag overlow
+        next_head = SERIAL_RXD;             // and do dummy read to clear interrupt
+    } else {
+        rxbuf[rx_head] = SERIAL_RXD;        // Add data to buffer
+        rx_head = next_head;                // and update pointer
 #ifdef XONXOFF
-		if (rx_off == XONOK && BUFCOUNT(rx_head, rx_tail, RX_BUFFER_SIZE) > RX_BUFFER_HWM) {
-	    	rx_off = XOFF;					// Queue XOFF at front
-	    	UC0IE |= UCA0TXIE; 				// and enable UART TX interrupt
-	    }
+        if (rx_off == XONOK && BUFCOUNT(rx_head, rx_tail, RX_BUFFER_SIZE) > RX_BUFFER_HWM) {
+            rx_off = XOFF;                  // Queue XOFF at front
+            SERIAL_IE |= SERIAL_TXIE;       // and enable UART TX interrupt
+        }
 #else
-		if (!(P1IN & RTS) && BUFCOUNT(rx_head, rx_tail, RX_BUFFER_SIZE) >= RX_BUFFER_HWM)
-			P1OUT |= RTS;
+        if (!(RTS_PORT_IN & RTS_BIT) && BUFCOUNT(rx_head, rx_tail, RX_BUFFER_SIZE) >= RX_BUFFER_HWM)
+            RTS_PORT_OUT |= RTS_BIT;
 #endif
-	}
-
+    }
 }
 
 #pragma vector=USCIAB0TX_VECTOR
 __interrupt void USCI0TX_ISR(void)
 {
+    if((SERIAL_IFG & SERIAL_TXIE) && (SERIAL_IE & SERIAL_TXIE)) { // UART
 
-	if(IFG2 & UCA0TXIFG) { // UART
+        uint16_t tail = tx_tail;                // Get buffer pointer
 
-		unsigned int tail = tx_tail;			// Get buffer pointer
+    #ifdef XONXOFF
+        if(rx_off == XON || rx_off == XOFF) {   // If we have XOFF/XON to send
+            SERIAL_TXD = rx_off;                // send it
+            rx_off |= 0x80;                     // and flag it sent
+        } else {
+    #endif
+            SERIAL_TXD = txbuf[tail++];         // Send next character and increment pointer
 
-	#ifdef XONXOFF
-		if(rx_off == XON || rx_off == XOFF) {	// If we have XOFF/XON to send
-			UCA0TXBUF = rx_off; 			  	// send it
-			rx_off |= 0x80;						// and flag it sent
-		} else {
-	#endif
-			UCA0TXBUF = txbuf[tail++]; 			// Send next character and increment pointer
+            if(tail == TX_BUFFER_SIZE)          // If at end
+                tail = 0;                       // wrap pointer around
 
-			if(tail == TX_BUFFER_SIZE) 			// If at end
-				tail = 0;						// wrap pointer around
+            tx_tail = tail;                     // Update global pointer
+    #ifdef XONXOFF
+        }
+    #endif
+        if(tail == tx_head)                     // If buffer empty then
+            SERIAL_IE &= ~SERIAL_TXIE;          // disable UART TX interrupt
+    }
 
-			tx_tail = tail;						// Update global pointer
-	#ifdef XONXOFF
-		}
-	#endif
-		if(tail == tx_head)						// If buffer empty then
-		   UC0IE &= ~UCA0TXIE; 					// disable UART TX interrupt
+#ifdef HAS_DAC
+    if((SERIAL_IFG & UCB0TXIFG) && (SERIAL_IE & UCB0TXIFG)) { // I2C
 
-	} else { // I2C
+        if(I2C_STAT & UCNACKIFG) {
+            I2C_STAT &= ~UCNACKIFG;
+            I2C_CTL1 |= UCTXSTP;                // I2C stop condition
+            LPM0_EXIT;                          // Exit LPM0
+        }
 
-		if(UCB0STAT & UCNACKIFG) {
-			UCB0STAT &= ~UCNACKIFG;
-			UCB0CTL1 |= UCTXSTP;				// I2C stop condition
-			LPM0_EXIT;							// Exit LPM0
-		}
-
-		if(TXCount)								// Still data to send?
-		{
-			UCB0TXBUF = *pTXBuffer++;			// Load TX buffer
-			TXCount--;							// Decrement TX byte counter
-		} else {
-			UCB0CTL1 |= UCTXSTP;				// I2C stop condition
-			IFG2 &= ~UCB0TXIFG;           		// Clear USCI_B0 TX int flag
-			LPM0_EXIT;							// Exit LPM0
-		}
-
-	}
+        if(TXCount) {                           // Still data to send?
+            I2C_TXD = *pTXBuffer++;             // Yep, load TX buffer
+            TXCount--;                          // and decrement TX byte counter
+        } else {
+            I2C_CTL1 |= UCTXSTP;                // Send I2C stop condition and
+            I2C_IFG &= ~UCB0TXIFG;              // clear TX int flag
+            LPM0_EXIT;                          // Exit LPM0
+        }
+    }
+#endif
 
 }
+
+#endif

@@ -1,13 +1,12 @@
 //
 // main.c - PCB exposer (for 405nm laser diode) - MSP430G2553
 //
-// v1.2 / 2017-02-08 / Io Engineering / Terje
-//
+// v1.5 / 2018-07-01 / Io Engineering / Terje
 //
 
 /*
 
-Copyright (c) 2015, Terje Io
+Copyright (c) 2015-2018, Terje Io
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without modification,
@@ -46,10 +45,20 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "config.h"
 #include "stepper.h"
 #include "serial.h"
 
-#define LASER BIT5 // P2.5
+#define LASER_PORT_IN   portIn(LASER_PORT)
+#define LASER_PORT_OUT  portOut(LASER_PORT)
+#define LASER_PORT_DIR  portDir(LASER_PORT)
+#if LASER_PORT == 2 && (LASER_BIT == BIT6 || LASER_BIT == BIT7)
+#define LASER_PORT_SEL  portSel(LASER_PORT)
+#define LASER_PORT_SEL2 portSel2(LASER_PORT)
+#endif
+
+#define VDAC_PORT_OUT  portOut(VDAC_PORT)
+#define VDAC_PORT_DIR  portDir(VDAC_PORT)
 
 #define PXSTEPS 1
 #define BYTEPIXELS 7
@@ -64,348 +73,523 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define MSG_BADC  6U
 
 char const *const message[] = {
-	"\r\nIo Engineering PCB Laser rev 1.2\0",
-	"ESTOP!",
-	"Error: missing parameters",
-	"Job running...",
-	"OK",
-	"FAILED",
-	"Bad command"
+    "\r\nIo Engineering PCB Laser rev 1.5\0",
+    "ESTOP!",
+    "Error: missing parameters",
+    "Job running...",
+    "OK",
+    "FAILED",
+    "Bad command"
 };
 
-char const *const command[] = {
-	"?",
-	"XPix:",
-	"YPix:",
-	"Start",
-	"MoveX:",
-	"MoveY:",
-	"MoveZ:",
-	"Laser:",
-	"Power:",
-	"ZeroAll",
-	"HomeXY",
-	"HomeX",
-	"HomeY",
-	"HomeZ",
-	"Echo:",
-	"XHome:"
-	"YHome:"
-	"XBComp:"
-};
-
-#define NUMCOMMANDS 18
+typedef struct {
+    char const *const command;
+    bool (*const handler)(char *);
+    const bool report;
+} command_t;
 
 const char cr = '\r';
 const char lf = '\n';
 
+#ifdef THK_KR33_Y
 const char ysteps[] = {6,5,6,5,6,6,6,5,6,5,6,6,6,5,6,5,6,6,6,5,6,5,6,5,6,5,6,5,6,6,6,5,6,5,6,6,6,5,6,5,6,6,6,5,6};
 const char ystepn = sizeof(ysteps) / sizeof(ysteps[0]);
+#endif
 
 char cmdbuf[16];
-unsigned int pxCounter, cancelled = 0, echo = 1, bcomp = 9;
+uint8_t pxCounter, cancelled = 0, echo = 1, bcomp = 0;
+uint16_t xpixels = 0, ypixels = 0;
 
-bool waitForRowStart (uint16_t line) {
+void exeCommand (char *cmdline);
 
-	uint16_t chr, count = 0, wait;
+bool waitForRowStart (uint16_t line)
+{
+    uint16_t chr, count = 0, wait;
 
-	pxCounter = BYTEPIXELS;
+    pxCounter = BYTEPIXELS;
 
-	while(serialRxCount() < 100); // wait for RX buffer to fill up a bit before proceeding
+    while(serialRxCount() < 100); // wait for RX buffer to fill up a bit before proceeding
 
-	if((chr = serialRead()) != '\n')
-		cancelled = 1;
+    if((chr = serialRead()) != '\n')
+        cancelled = 1;
 
-	wait = !cancelled;
+    wait = !cancelled;
 
-	while(wait) {
-		if(serialRxCount()) {
-			if((chr = serialRead()) == ':') {
-				wait = 0;
-				cmdbuf[count] = '\0';
-				// validate linenumber?
-			} else if(chr > 31 && count < 15)
-				cmdbuf[count++] = chr;
-			else if(chr == EOF) {
-				wait = 0;
-				cancelled = 1;
-			}
-		}
-	}
+    while(wait) {
+        if(serialRxCount()) {
+            if((chr = serialRead()) == ':') {
+                wait = 0;
+                cmdbuf[count] = '\0';
+                // validate linenumber?
+            } else if(chr > 31 && count < 15)
+                cmdbuf[count++] = chr;
+            else if(chr == EOF) {
+                wait = 0;
+                cancelled = 2;
+            }
+        }
+    }
 
-	if(!cancelled && (chr = serialRead()) == EOF)
-		cancelled = 1;
+    if(!cancelled && (chr = serialRead()) == EOF)
+        cancelled = 3;
 
-	return chr - BYTEOFFSET;
-
+    return chr - BYTEOFFSET;
 }
 
-bool renderRow (unsigned int x, unsigned int y) {
+bool renderRow (uint16_t x, uint16_t y)
+{
+    struct axis *axis;
+    uint16_t pixels, rows = y;
+#ifdef THK_KR33_Y
+    uint16_t yseq = 0;
+#endif
 
-	struct axis *axis;
-	uint16_t pixels, yseq = 0, rows = y;
+    if(switch_status().eStop)
+        return false;
 
-	if(isESTOP())
-		return false;
+    enableMotors(true);
 
-	serialWriteLn(message[MSG_RUN]);
+    serialWriteLn(message[MSG_RUN]);
 
-	cancelled = 0;
+    cancelled = 0;
 
-	axis = calcXParams(x - 1);
+    axis = calcXParams(x - 1);
 
-	setXBacklashComp(bcomp);
+    setXBacklashComp(bcomp);
 
-	zeroAll();
+    zeroAll();
 
-	while(!cancelled && rows--) {
+    while(!cancelled && rows--) {
 
-		pixels = waitForRowStart(y - rows);
+        pixels = waitForRowStart(y - rows);
 
-		if(!cancelled)
-			startX();
+        if(!cancelled)
+            startX();
 
-		while(axis->busy) {
+        while(axis->busy) {
 
-			if(pixels & 0x01)
-				P2OUT |= LASER;
-			else
-				P2OUT &= ~LASER;
+            if(pixels & 0x01)
+                LASER_PORT_OUT |= LASER_BIT;
+            else
+                LASER_PORT_OUT &= ~LASER_BIT;
 
-			if(--pxCounter)
-				pixels = pixels >> 1;
+            if(--pxCounter)
+                pixels = pixels >> 1;
 
-			else {
+            else {
 
-				pxCounter = BYTEPIXELS;
+                pxCounter = BYTEPIXELS;
 
-				if((pixels = serialRead()) == EOF) {
-					stopX();
-					cancelled = 1;
-				}
+                if((pixels = serialRead()) == EOF) {
+                    stopX();
+                    cancelled = 4;
+                }
 
-				pixels -= BYTEOFFSET;
+                pixels -= BYTEOFFSET;
 
-			}
+            }
 
-			if(axis->busy)
-				LPM0;
+            if(axis->busy)
+                LPM0;
 
-		}
+        }
 
-		if(!cancelled) {
+        if(!cancelled) {
 
-			P2OUT |= LASER; 		// Switch off laser
+            LASER_PORT_OUT |= LASER_BIT;    // Switch off laser
 
-			moveY(ysteps[yseq++]);	// Move table one pixel in Y direction
-			toggleXDir();			// and change X direction
+            toggleXDir();                   // and change X direction
 
-			if(yseq == ystepn)
-				yseq = 0;
+#ifdef THK_KR33_Y
+            moveY(ysteps[yseq++]);          // Move table one pixel in Y direction
+            if(yseq == ystepn)
+                yseq = 0;
+#else
+            moveY(1);                       // Move table one pixel in Y direction
+#endif
+        }
 
-		}
+    }
 
-	}
+    if(cancelled)
+        serialRxFlush();
 
-	if(cancelled)
-		serialRxFlush();
+    stopAll();
 
-	stopAll();
+    moveX(-getXPos());              // Move table back
+    moveY(-getYPos());              // to origin
 
-	moveX(-getXPos());			// Move table back
-	moveY(-getYPos());			// to origin
+    LASER_PORT_OUT |= LASER_BIT;    // switch off laser (ESTOP may have been requested)
 
-	P2OUT |= LASER; 			// switch off laser (ESTOP may have been requested)
-
-	return !isESTOP() && !cancelled;
-
+    return !switch_status().eStop && !cancelled;
 }
 
 int parseInt (char *s) {
 
-	int c, res = 0, negative = 0;
+    int c, res = 0, negative = 0;
 
-	if(*s == '-') {
-		negative = 1;
-		s++;
-	} else if(*s == '+')
-		s++;
+    if(*s == '-') {
+        negative = 1;
+        s++;
+    } else if(*s == '+')
+        s++;
 
-	while((c = *s++) != '\0') {
-		if(c >= 48 && c <= 57)
-			res = (res * 10) + c - 48;
-	}
+    while((c = *s++) != '\0') {
+        if(c >= 48 && c <= 57)
+            res = (res * 10) + c - 48;
+    }
 
-	return negative ? -res : res;
-
+    return negative ? -res : res;
 }
 
-unsigned char parseCommand (char *cmd) {
+#ifdef __MSP430F5310__
 
-	unsigned char x = 0, hit = 0;
-
-	while(!hit && x < NUMCOMMANDS) {
-
-		if(!strncmp(command[x], cmd, strlen(command[x])))
-			hit = 1;
-		else
-			x++;
-
-	}
-
-	return x;
-
+void SetVCoreUp (unsigned int level)
+{
+    // Open PMM registers for write access
+    PMMCTL0_H = 0xA5;
+    // Set SVS/SVM high side new level
+    SVSMHCTL = SVSHE + SVSHRVL0 * level + SVMHE + SVSMHRRL0 * level;
+    // Set SVM low side to new level
+    SVSMLCTL = SVSLE + SVMLE + SVSMLRRL0 * level;
+    // Wait till SVM is settled
+    while ((PMMIFG & SVSMLDLYIFG) == 0);
+    // Clear already set flags
+    PMMIFG &= ~(SVMLVLRIFG + SVMLIFG);
+    // Set VCore to new level
+    PMMCTL0_L = PMMCOREV0 * level;
+    // Wait till new level reached
+    if ((PMMIFG & SVMLIFG))
+        while ((PMMIFG & SVMLVLRIFG) == 0);
+    // Set SVS/SVM low side to new level
+    SVSMLCTL = SVSLE + SVSLRVL0 * level + SVMLE + SVSMLRRL0 * level;
+    // Lock PMM registers for write access
+    PMMCTL0_H = 0x00;
 }
 
-void main(void) {
+#endif
 
-	char cmd;
-	unsigned int cmdptr = 0, xpixels = 0, ypixels = 0;
+void main (void)
+{
+    char c;
+    uint16_t cmdptr = 0;
 
-	WDTCTL = WDTPW | WDTHOLD;				// Stop watchdog timer
-	DCOCTL = CALDCO_16MHZ;                  // Set DCO for 16MHz using
-	BCSCTL1 = CALBC1_16MHZ;                 // calibration registers
+    WDTCTL = WDTPW | WDTHOLD;               // Stop watchdog timer
 
-	P1DIR = 0xFF;                           // All P1 outputs
-	P1OUT = 0;                              // Clear P1 outputs
-	P2DIR |= LASER;                         // Enable laser output on P2
-//	P3DIR = 0xFF;                           // All P3 outputs
-//	P3OUT = 0;                              // Clear P3 outputs
+#ifdef __MSP430F5310__
 
-	P2OUT |= LASER; 						// switch off laser!
+    /* remap some pins */
+/*
+    PMAPKEYID = PMAPKEY;
+    P4MAP7 = PM_UCB1SDA;
+    P4MAP6 = PM_UCB1SCL;
+    P4MAP2 = PM_TB0CCR1A;
+    PMAPKEYID = 0;
+*/
+    /* Power settings */
+     SetVCoreUp(1u);
+     SetVCoreUp(2u);
+     SetVCoreUp(3u);
 
-	serialInit();
-	stepperInit();
+     UCSCTL3 = SELREF__REFOCLK;    // select REFO as FLL source
+     UCSCTL6 = XT1OFF | XT2OFF;    // turn off XT1 and XT2
 
-	_EINT();                                // Enable interrupts
+     /* Initialize DCO to 25.00MHz */
+     __bis_SR_register(SCG0);                  // Disable the FLL control loop
+     UCSCTL0 = 0x0000u;                        // Set lowest possible DCOx, MODx
+     UCSCTL1 = DCORSEL_5;                      // Set RSELx for DCO = 50 MHz
+     UCSCTL2 = 762u;                            // Set DCO Multiplier for 25MHz
+                                               // (N + 1) * FLLRef = Fdco
+                                               // (762 + 1) * 32768 = 25.00MHz
+     UCSCTL4 = SELA__REFOCLK | SELS__DCOCLK | SELM__DCOCLK;
+//     UCSCTL4 = SELA__XT1CLK | SELS__DCOCLK | SELM__DCOCLK;
+     __bic_SR_register(SCG0);                  // Enable the FLL control loop
 
-	initDAC();
+     // Worst-case settling time for the DCO when the DCO range bits have been
+     // changed is n x 32 x 32 x f_MCLK / f_FLL_reference. See UCS chapter in 5xx
+     // UG for optimization.
+     // 32*32*25MHz/32768Hz = 781250 = MCLK cycles for DCO to settle
+     __delay_cycles(781250u);
 
-	serialRxFlush();
-	serialWriteLn(message[MSG_ABOUT]);
-	serialWriteLn(message[isESTOP() ? MSG_ESTOP : MSG_OK]);
+     /* Loop until XT1,XT2 & DCO fault flag is cleared */
+     do {
+       UCSCTL7 &= ~(XT2OFFG + XT1LFOFFG + DCOFFG);  // Clear XT2,XT1,DCO fault flags
+       SFRIFG1 &= ~OFIFG;                           // Clear fault flags
+     } while (SFRIFG1&OFIFG);                       // Test oscillator fault flag
 
-	while(1) {
+#else
+    DCOCTL = CALDCO_16MHZ;                  // Set DCO for 16MHz using
+    BCSCTL1 = CALBC1_16MHZ;                 // calibration registers
+#endif
 
-		if(serialRxCount()) { // bytes waiting, process them
+//    P1DIR = 0xFF;                           // All P1 outputs
+//    P1OUT = 0;                              // Clear P1 outputs
+    LASER_PORT_DIR |= LASER_BIT;            // Enable laser output on P2
+#ifdef LASER_PORT_SEL
+    LASER_PORT_SEL &= ~LASER_BIT;
+#endif
+#ifdef LASER_PORT_SEL2
+    LASER_PORT_SEL2 &= ~LASER_BIT;
+#endif
+    LASER_PORT_OUT |= LASER_BIT;            // switch off laser!
 
-			cmd = serialRead();
+#ifdef VDAC_PORT
+    VDAC_PORT_DIR |= VDAC_BIT;
+    VDAC_PORT_OUT |= VDAC_BIT;
+#endif
 
-			if(echo)
-				serialPutC(cmd);
+    //  P3DIR = 0xFF;                           // All P3 outputs
+    //  P3OUT = 0;                              // Clear P3 outputs
 
-			if(cmd == cr && cmdptr > 0) {
+    serialInit();
+    stepperInit();
 
-				cmdbuf[cmdptr] = 0;
+    _EINT();                                // Enable interrupts
 
-				if(echo)
-					serialPutC(lf);
+#ifdef HAS_DAC
+    initDAC();
+#endif
 
-				switch(parseCommand(cmdbuf)) {
+    serialRxFlush();
+    serialWriteLn(message[MSG_ABOUT]);
+    serialWriteLn(message[switch_status().eStop ? MSG_ESTOP : MSG_OK]);
 
-					case 0: 	// ?
-						serialWriteLn(message[MSG_ABOUT]);
-						serialWriteLn(message[isESTOP() ? MSG_ESTOP : MSG_OK]);
-						break;
+    while(1) {
 
-					case 1: 	// XPix
-						xpixels = parseInt(&(cmdbuf[5]));
-						break;
+        if(serialRxCount()) { // bytes waiting, process them
 
-					case 2:		// YPix
-						ypixels = parseInt(&(cmdbuf[5]));
-						break;
+            c = serialRead();
 
-					case 3:		// Start
-						if(xpixels == 0 || ypixels == 0)
-							serialWriteLn(message[MSG_PARAM]);
-						else
-							serialWriteLn(message[renderRow(xpixels, ypixels) ? MSG_OK : MSG_FAIL]);
-						break;
+            if(echo)
+                serialPutC(c);
 
-					case 4:  	// MoveX
-						serialWriteLn(message[moveX(parseInt(&(cmdbuf[6]))) ? MSG_OK : MSG_FAIL]);
-						break;
+            if(c == cr && cmdptr > 0) {
 
-					case 5:  	// MoveY
-						serialWriteLn(message[moveY(parseInt(&(cmdbuf[6]))) ? MSG_OK : MSG_FAIL]);
-						break;
+                cmdbuf[cmdptr] = 0;
 
-					case 6:  	// MoveZ
-						serialWriteLn(message[moveZ(parseInt(&(cmdbuf[6]))) ? MSG_OK : MSG_FAIL]);
-						break;
+                if(echo)
+                    serialPutC(lf);
 
-					case 7: 	// Laser (0|1)
-						if(parseInt(&(cmdbuf[6])) == 0)
-							P2OUT |= LASER;						// switch off laser
-						else
-							P2OUT &= ~LASER; 					// switch on laser
-						serialWriteLn(message[MSG_OK]);
-						break;
+                exeCommand(cmdbuf);
 
-					case 8: 	// Power
-						serialWriteLn(message[MSG_OK]);
-						setVoltage(parseInt(&(cmdbuf[6])), 0);
-						break;
+                cmdptr = 0;
+                cmdbuf[0] = 0;
 
-					case 9:		// ZeroAll
-						zeroAll();
-						serialWriteLn(message[MSG_OK]);
-						break;
+            } else if(c == DEL) {
+                if(cmdptr > 0)
+                    cmdptr--;
+            } else if(c > 31 && cmdptr < sizeof(cmdbuf))
+                cmdbuf[cmdptr++] = c & (c >= 'a' && c <= 'z' ? 0x5F : 0xFF);
+        }
+    }
+}
 
-					case 10:	// HomeXY
-						homeX();
-						homeY();
-						serialWriteLn(message[MSG_OK]);
-						break;
+bool about (char *params)
+{
+    serialWriteLn(message[MSG_ABOUT]);
+    serialWriteS("OPT:");
+#ifdef HAS_DAC
+    serialPutC('D');
+#endif
+#ifdef XMOT_PORT
+    serialPutC('M');
+#endif
+#ifdef HAS_FOCUS
+    serialPutC('Z');
+#endif
+    serialWriteLn("");
+    serialWriteLn(message[switch_status().eStop ? MSG_ESTOP : MSG_OK]);
+    return true;
+}
 
-					case 11:	// HomeX
-						homeX();
-						serialWriteLn(message[MSG_OK]);
-						break;
+bool setXPixels (char *params)
+{
+    xpixels = parseInt(params);
+    return true;
+}
 
-					case 12:	// HomeY
-						homeY();
-						serialWriteLn(message[MSG_OK]);
-						break;
+bool setYPixels (char *params)
+{
+    ypixels = parseInt(params);
+    return true;
+}
 
-					case 13:	// HomeZ
-						homeZ();
-						serialWriteLn(message[MSG_OK]);
-						break;
+bool start (char *params)
+{
+    if(xpixels == 0 || ypixels == 0)
+        serialWriteLn(message[MSG_PARAM]);
+    else
+        serialWriteLn(message[renderRow(xpixels, ypixels) ? MSG_OK : MSG_FAIL]);
+    return true;
+}
 
-					case 14:	// Echo
-						echo = parseInt(&(cmdbuf[5])) != 0;
-						break;
+bool moveXaxis (char *params)
+{
+    enableMotors(true);
+    return moveX(parseInt(params));
+}
 
-					case 15:  	// XHome
-						setXHomePos(parseInt(&(cmdbuf[6])));
-						serialWriteLn(message[MSG_OK]);
-						break;
+bool moveYaxis (char *params) {
+    enableMotors(true);
+    return moveY(parseInt(params));
+}
 
-					case 16:  	// YHome
-						setYHomePos(parseInt(&(cmdbuf[6])));
-						serialWriteLn(message[MSG_OK]);
-						break;
+bool moveZaxis (char *params) {
+    enableMotors(true);
+    return moveZ(parseInt(params));
+}
 
-					case 17:  	// XBComp
-						bcomp = parseInt(&(cmdbuf[6]));
-						serialWriteLn(message[MSG_OK]);
-						break;
+bool laser (char *params)
+{
+    if(parseInt(params) == 0)
+        LASER_PORT_OUT |= LASER_BIT;    // switch off laser
+    else
+        LASER_PORT_OUT &= ~LASER_BIT;   // switch on laser
+    return true;
+}
 
-					default:	// Bad command
-						serialWriteLn(message[MSG_BADC]);
-						break;
+bool power (char *params)
+{
+#ifdef HAS_DAC
+    setVoltage(parseInt(params), false);
+#endif
+    return true;
+}
 
-				}
+bool zeroAllaxes (char *params)
+{
+    zeroAll();
+    return true;
+}
 
-				cmdptr = 0;
-				cmdbuf[0] = 0;
+bool homeXYaxses (char *params)
+{
+    homeX();
+    homeY();
+    return true;
+}
 
-			} else if(cmd != lf) {
-				cmdbuf[cmdptr++] = cmd;
-				cmdptr &= 0x0F;
-			}
-		}
-	}
+bool homeXaxis (char *params)
+{
+    homeX();
+    return true;
+}
+
+bool homeYaxis (char *params)
+{
+    homeY();
+    return true;
+}
+
+bool homeZaxis (char *params)
+{
+    homeZ();
+    return true;
+}
+
+bool echoMode (char *params)
+{
+    echo = parseInt(params) != 0;
+    return true;
+}
+
+bool XHomePos (char *params)
+{
+    setXHomePos(parseInt(params));
+    return true;
+}
+
+bool YHomePos (char *params)
+{
+    setYHomePos(parseInt(params));
+    return true;
+}
+
+bool XBComp (char *params)
+{
+    bcomp = parseInt(params);
+    return true;
+}
+
+bool motorsOn (char *params)
+{
+    enableMotors(parseInt(params) != 0);
+    return true;
+}
+
+bool switches (char *params)
+{
+    switches_t status = switch_status();
+
+    serialWriteS("SW:");
+
+    if(status.eStop)
+        serialPutC('E');
+
+    if(status.xHome)
+        serialPutC('X');
+
+    if(status.yHome)
+        serialPutC('Y');
+
+    if(status.zHome)
+        serialPutC('Z');
+
+    serialWriteLn("");
+
+    return true;
+}
+
+void exeCommand (char *cmdline)
+{
+    static const command_t commands[] = {
+        "?",        about, false,
+        "XPIX:",    setXPixels, false,
+        "YPIX:",    setYPixels, false,
+        "START",    start, false,
+        "MOVEX:",   moveXaxis, true,
+        "MOVEY:",   moveYaxis, true,
+        "X:",       moveXaxis, true,
+        "Y:",       moveYaxis, true,
+        "LASER:",   laser, true,
+        "ZEROALL",  zeroAllaxes, true,
+        "HOMEXY",   homeXYaxses, true,
+        "HOMEX",    homeXaxis, true,
+        "HOMEY",    homeYaxis, true,
+#ifdef HAS_DAC
+        "POWER:",   power, true,
+#endif
+#ifdef HAS_FOCUS
+        "MOVEZ:",   moveZaxis, true,
+        "Z:",       moveZaxis, true,
+        "HOMEZ",    homeZaxis, true,
+#endif
+        "ECHO:",    echoMode, false,
+        "XHOME:",   XHomePos, true,
+        "YHOME",    YHomePos, true,
+        "XBCOMP:",  XBComp, true,
+        "MOTORS:",  motorsOn, true,
+        "SWITCHES", switches, false
+    };
+
+    static const uint16_t numcmds = sizeof(commands) / sizeof(command_t);
+
+    bool ok = false;
+    uint16_t i = 0, cmdlen;
+
+    while(!ok && i < numcmds) {
+
+        cmdlen = strlen(commands[i].command);
+
+        if(!(ok = !strncmp(commands[i].command, cmdline, cmdlen)))
+            i++;
+
+    }
+
+    if(ok) {
+        ok = commands[i].handler(cmdline + cmdlen);
+        if(commands[i].report)
+            serialWriteLn(message[ok ? MSG_OK : MSG_FAIL]);
+    } else
+        serialWriteLn(message[MSG_BADC]);
 }

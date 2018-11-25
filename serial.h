@@ -1,13 +1,13 @@
 //
 // serial.h - serial (UART) port library including MCP4725 DAC support, for PCB laser
 //
-// v1.0 / 2015-01-26 / Io Engineering / Terje
+// v1.5 / 2018-06-18 / Io Engineering / Terje
 //
 //
 
 /*
 
-Copyright (c) 2015, Terje Io
+Copyright (c) 2015-2018, Terje Io
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without modification,
@@ -38,41 +38,85 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
 #include <stdbool.h>
+#include <stdint.h>
+
+#include "config.h"
 
 #define XON  0x11
 #define XOFF 0x13
 #define EOF  0x1A
+#define BS   0x08
+#define LF   0x0A
+#define CR   0x0D
+#define CAN  0x18
+#define DEL  0x7F
 
 #define XONOK (XON|0x80)
 #define XOFFOK (XOFF|0x80)
+
 #define TX_BUFFER_SIZE 16
+
+#ifdef __MSP430F5310__
+#define RX_BUFFER_SIZE 1024
+#define RX_BUFFER_HWM 900
+#define RX_BUFFER_LWM 400
+#else
 #define RX_BUFFER_SIZE 192
 #define RX_BUFFER_HWM 188
 #define RX_BUFFER_LWM 150
+#endif
 
-#define RXD BIT1 // P1.1
-#define TXD BIT2 // P1.2
-#define CTS BIT4 // P1.4
-#define RTS BIT3 // P3.1
+#define RTS_PORT_IN   portIn(RTS_PORT)
+#define RTS_PORT_OUT  portOut(RTS_PORT)
+#define RTS_PORT_DIR  portDir(RTS_PORT)
+
+#define SERIAL_SEL portSel(SERIAL_PORT)
+#ifndef __MSP430F5310__
+#define SERIAL_SEL2 portSel2(SERIAL_PORT)
+#endif
+#define SERIAL_MCTL uartMCTL(SERIAL_MODULE)
+#define SERIAL_CTL0 uartCTL(SERIAL_MODULE, 0)
+#define SERIAL_CTL1 uartCTL(SERIAL_MODULE, 1)
+#define SERIAL_BR0 uartBR(SERIAL_MODULE, 0)
+#define SERIAL_BR1 uartBR(SERIAL_MODULE, 1)
+#define SERIAL_IE uartIE(SERIAL_MODULE)
+#define SERIAL_IFG uartIFG(SERIAL_MODULE)
+#define SERIAL_RXD uartRXD(SERIAL_MODULE)
+#define SERIAL_TXD uartTXD(SERIAL_MODULE)
+
+#define I2C_SEL portSel(I2C_PORT)
+#ifndef __MSP430F5310__
+#define I2C_SEL2 portSel2(I2C_PORT)
+#endif
+#define I2C_CTL0 uartCTL(I2C_MODULE, 0)
+#define I2C_CTL1 uartCTL(I2C_MODULE, 1)
+#define I2C_BR0 uartBR(I2C_MODULE, 0)
+#define I2C_BR1 uartBR(I2C_MODULE, 1)
+#define I2C_IE uartIE(I2C_MODULE)
+#define I2C_IFG uartIFG(I2C_MODULE)
+#define I2C_STAT uartSTAT(I2C_MODULE)
+#define I2C_RXD uartRXD(I2C_MODULE)
+#define I2C_TXD uartTXD(I2C_MODULE)
+#define I2C_CSA uartI2CSA(I2C_MODULE)
 
 /* UART */
 
 void serialInit (void);
-unsigned int serialTxCount(void);
-unsigned int serialRxCount(void);
+uint16_t serialTxCount(void);
+uint16_t serialRxCount(void);
 void serialRxFlush (void);
 char serialRead (void);
 void serialPutC (const char data);
 void serialWriteS (const char *data);
 void serialWriteLn (const char *data);
-void serialWrite (const char *data, unsigned int length);
+void serialWrite (const char *data, uint16_t length);
 
 /* MCP4725 DAC */
 
 #define MCP4725_WRITE       (0x40)  // Writes data to the DAC
 #define MCP4725_WRITEEEPROM (0x60)  // Writes data to the DAC and EEPROM
 
-void setVoltage (unsigned int value, bool writeEEPROM);
+void setVoltage (uint16_t value, bool writeEEPROM);
 void resetDAC (void);
 void wakeUpDAC (void);
 void initDAC (void) ;

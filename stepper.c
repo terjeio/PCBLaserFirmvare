@@ -1,16 +1,16 @@
 //
 // stepper.c - stepper control library, for PCB laser
 //
-// v1.2 / 2017-02-08 / Io Engineering / Terje
+// v1.5 / 2018-06-19 / Io Engineering / Terje
 //
-// Calculations based on GT2 belt and 17 teeth pulleys: 1195.904 steps per inch (vs 1200) -> +0,085mm error/inch (scale factor: 1.0034)
-// Driver is set to 8 microsteps for a 200 steps/rev motor
+// Calculations based 1200 DPI resolution with GT2 belt and 17 teeth pulleys: 1195.904 steps per inch (vs 1200) -> +0,085mm error/inch (scale factor: 1.0034)
+// Driver must be set to 8 microsteps for a 200 steps/rev motor when steps per pixels is configured to 1
 // Real scale factor for my CNC router is 1.0055
 //
 
 /*
 
-Copyright (c) 2015, Terje Io
+Copyright (c) 2015-2018, Terje Io
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without modification,
@@ -51,70 +51,111 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define YHOMEFLAG 0x02
 #define ZHOMEFLAG 0x04
 
-static unsigned char homeFlags = 0;
-static unsigned int rampCounter, fspCounter;
+static uint8_t homeFlags = 0;
+static uint16_t rampCounter, fspCounter;
 static struct axis xAxis, yAxis, zAxis, *yzAxis;
 
-static void setDefaults (axis *axis, unsigned char dirBit) {
-
-	axis->dir        = 1;
-	axis->dirBit     = dirBit;
+static void setDefaults (axis *axis, uint8_t stppx)
+{
+	axis->dir        = 2; // 2 means not set
 	axis->position   = 0;
 	axis->bComp      = 0;
 	axis->cComp      = 0;
+	axis->stppx      = stppx;
 	axis->homeOffset = 0;
-
 }
 
-void stepperInit (void) {
+void stepperInit (void)
+{
 
 // X-axis
 
-	P1DIR &= ~XHOME;						// Enable XHOME pin as input
-	P1OUT |= XHOME;                        	// and
-	P1REN |= XHOME;                        	// enable pullup
+    XSTEP_CCR0 = accprofile[0];         // Set inital step time and
+    XSTEP_CCR1 = STEPPULSE;             // pulse width
+    XSTEP_CCTL1 = OUTMOD_7;             // Set output mode to PWM,
+    XSTEP_CTL = TASSEL1|TACLR;          // bind to SMCLK and clear TA
+#ifdef XSTEP_PORT_SEL
+    XSTEP_PORT_SEL |= XSTEP_BIT;        // Enable TA0.1 on XSTEP pin
+#endif
+#ifdef XSTEP_PORT_SEL2
+    XSTEP_PORT_SEL2 &= ~XSTEP_BIT;
+#endif
+    XSTEP_PORT_DIR |= XSTEP_BIT;        // Set X step and
 
-	TA0CCR0 = accprofile[0];                // Set inital step time and
-	TA0CCR1 = STEPPULSE;                    // pulse width
-	TA0CCTL1 = OUTMOD_7;                    // Set output mode to PWM,
-	TA0CTL = TASSEL1+TACLR;                 // bind to SMCLK and clear TA
+#ifdef XDIR_PORT_SEL
+    XDIR_PORT_SEL &= ~XDIR_BIT;         // Enable TA0.1 on XSTEP pin
+#endif
+#ifdef XDIR_PORT_SEL2
+    XDIR_PORT_SEL2 &= ~XDIR_BIT;
+#endif
 
-	setDefaults(&xAxis, XDIR);
+    XDIR_PORT_DIR |= XDIR_BIT;          // dir pins as outputs
+
+    XHOME_PORT_DIR &= ~XHOME_BIT;	    // Enable XHOME pin as input
+    XHOME_PORT_OUT |= XHOME_BIT;        // and
+    XHOME_PORT_REN |= XHOME_BIT;        // enable pullup
+
+
+#ifdef XMOT_PORT
+#if XMOT_PORT == 2 && XMOT_BIT == BIT7
+	XMOT_PORT_SEL &= ~XMOT_BIT;         // Enable TA1.0 on Y/ZSTEP pin
+	XMOT_PORT_SEL2 &= ~XMOT_BIT;        // Enable secondary function for XDIR and XSTEP
+#endif
+    XMOT_PORT_DIR |= XMOT_BIT;
+#endif
+
+	setDefaults(&xAxis, XSTPPIXELS);
 
 	xAxis.homeOffset = 150;
 
-// Y and Z-axis - NOTE: axes shares P2 TA1 so cannot be driven simultaneously
+// Y and Z-axis - NOTE: axes shares the same timer so cannot be driven simultaneously
 
-	P2SEL |= XSTEP|YSTEP;      				// Enable TA1.0 on Y/ZSTEP pin
-	P2SEL &= ~(XDIR);      					// Enable TA1.0 on Y/ZSTEP pin
-	P2SEL2 &= ~(XDIR|XSTEP);      			// Enable secondary function for XDIR and XSTEP
+    YSTEP_CCR0 = accprofile[0];         // Set initial step time and
+    YSTEP_CCR1 = STEPPULSE;             // pulse width
+    YSTEP_CCTL1 = OUTMOD_7;             // Set output mode to PWM,
+    YSTEP_CTL = TASSEL1|TACLR;          // bind to SMCLK and clear TA
+    YSTEP_PORT_SEL |= YSTEP_BIT;        // Enable TA1.0 on Y/ZSTEP pins
+	YSTEP_PORT_DIR |= YSTEP_BIT;        // Set step pins as outputs
 
-	P2DIR |= XDIR|XSTEP|YSTEP|ZSTEP;
-	P3DIR |= YDIR|ZDIR;
-	P2DIR &= ~(YHOME|ZHOME);				// Enable Y & ZHOME pins as input
-	P2OUT |= YHOME|ZHOME;                   // and
-	P2REN |= YHOME|ZHOME;                   // enable pullup
+	YDIR_PORT_DIR |= YDIR_BIT;          // Set Y  & Z direction pins as output
 
-	TA1CCR0 = accprofile[0];                // Set initial step time and
-	TA1CCR1 = STEPPULSE;                    // pulse width
-	TA1CCTL1 = OUTMOD_7;                    // Set output mode to PWM,
-	TA1CTL = TASSEL1+TACLR;                 // bind to SMCLK and clear TA
+	YHOME_PORT_DIR &= ~YHOME_BIT;       // Enable Y & ZHOME pins as input
+    YHOME_PORT_OUT |= YHOME_BIT;        // and
+    YHOME_PORT_REN |= YHOME_BIT;        // enable pullup
+#ifdef YMOT_PORT
+    YMOT_PORT_DIR |= YMOT_BIT;
+#endif
 
-	setDefaults(&yAxis, YDIR);
-	setDefaults(&zAxis, ZDIR);
+    setDefaults(&yAxis, YSTPPIXELS);
 
-	P3DIR &= ~ESTOP;						// Set ESTOP pin as input
-	P3OUT |= ESTOP;                        	// and
-	P3REN |= ESTOP;                        	// enable pullup
+#ifdef HAS_FOCUS
+    ZSTEP_PORT_SEL |= ZSTEP_BIT;        // Enable TA1.0 on Y/ZSTEP pins
+    ZSTEP_PORT_DIR |= ZSTEP_BIT;        // Set step pins as outputs
 
+    ZDIR_PORT_DIR |= ZDIR_BIT;          // Set Y  & Z direction pins as output
+    ZHOME_PORT_DIR &= ~ZHOME_BIT;       // Enable Y & ZHOME pins as input
+    ZHOME_PORT_OUT |= ZHOME_BIT;        // and
+    ZHOME_PORT_REN |= ZHOME_BIT;        // enable pullup
+#ifdef ZMOT_PORT
+    ZMOT_PORT_DIR |= ZMOT_BIT;
+#endif
+
+	setDefaults(&zAxis, YSTPPIXELS);
+#endif
+
+	ESTOP_PORT_DIR &= ~ESTOP_BIT;	    // Set ESTOP pin as input
+	ESTOP_PORT_OUT |= ESTOP_BIT;        // and
+	ESTOP_PORT_REN |= ESTOP_BIT;        // enable pullup
+
+	enableMotors(false);
 }
 
-struct axis *calcParams (const int16_t pixels, struct axis *axis) {
+struct axis *calcParams (const int16_t pixels, struct axis *axis)
+{
+	uint16_t steps = abs(pixels);
+	uint8_t dir = pixels >= 0 ? 1 : 0;
 
-	int steps = abs(pixels);
-	int dir = pixels >= 0 ? 1 : 0;
-
-	axis->busy = STATE_IDLE;
+	axis->busy = State_Idle;
 	axis->fsSteps = steps & 0x0001;
 	steps = steps & 0xFFFE;
 	axis->fsSteps += steps > RAMPSTEPS ? steps - RAMPSTEPS : 0;
@@ -122,75 +163,139 @@ struct axis *calcParams (const int16_t pixels, struct axis *axis) {
 	axis->profile = &accprofile[0];
 
 	if (axis->dir != dir) {
+
 		axis->cComp = axis->bComp;
 		axis->dir = dir;
-		__delay_cycles(50000);
+
+	    if(axis == &xAxis) {
+	        if(dir)
+	            XDIR_PORT_OUT |= XDIR_BIT;
+	        else
+	            XDIR_PORT_OUT &= ~XDIR_BIT;
+	    } else if(axis == &yAxis) {
+	        if(dir)
+	            YDIR_PORT_OUT &= ~YDIR_BIT;
+	        else
+	            YDIR_PORT_OUT |= YDIR_BIT;
+	    }
+#ifdef HAS_FOCUS
+	    else {
+	        if(dir)
+	            ZDIR_PORT_OUT &= ~ZDIR_BIT;
+	        else
+	            ZDIR_PORT_OUT |= ZDIR_BIT;
+	    }
+#endif
+	    __delay_cycles(50000);
 	}
 
 	return axis;
-
 }
 
-struct axis *calcXParams (const int16_t pixels) {
-	P2OUT |= XDIR;
-	return calcParams (pixels, &xAxis);
+struct axis *calcXParams (const int16_t pixels)
+{
+	return calcParams(pixels, &xAxis);
 }
 
-bool isESTOP (void) {
-	return (P3IN & ESTOP) != 0;
+switches_t switch_status (void) {
+
+    switches_t status = {0};
+
+    status.xHome = (XHOME_PORT_IN & XHOME_BIT) != 0;
+    status.yHome = (YHOME_PORT_IN & YHOME_BIT) != 0;
+#ifdef HAS_FOCUS
+    status.zHome = (ZHOME_PORT_IN & ZHOME_BIT) != 0;
+#endif
+    status.eStop = (ESTOP_PORT_IN & ESTOP_BIT) != 0;
+
+    return status;
 }
 
-int16_t getXPos(void) {
+int16_t getXPos (void)
+{
 	return xAxis.position;
 }
 
-void setXHomePos (uint16_t homeOffset) {
+void setXHomePos (uint16_t homeOffset)
+{
 	xAxis.homeOffset = homeOffset;
 }
 
-void setXBacklashComp (uint16_t steps) {
+void setXBacklashComp (uint16_t steps)
+{
 	xAxis.bComp = steps;
 }
 
-int16_t getYPos(void) {
+int16_t getYPos(void)
+{
 	return yAxis.position;
 }
 
-void setYHomePos (uint16_t homeOffset) {
+void setYHomePos (uint16_t homeOffset)
+{
 	yAxis.homeOffset = homeOffset;
 }
 
-int getZPos(void) {
+int getZPos (void) {
 	return zAxis.position;
 }
 
-void zeroAll (void) {
+void zeroAll (void)
+{
 	xAxis.position = 0;
 	yAxis.position = 0;
 	zAxis.position = 0;
 }
 
-void stopAll (void) {
-	TA0CTL &= ~MC0;     		// stop timer 0,
-	TA1CTL &= ~MC0;     		// timer 1 and
-	xAxis.busy = STATE_IDLE;	// set all
-	yAxis.busy = STATE_IDLE;	// axes to
-	zAxis.busy = STATE_IDLE;	// idle
+void enableMotors (bool on)
+{
+#ifdef XMOT_PORT
+    if(on) {
+        XMOT_PORT_OUT &= ~XMOT_BIT;
+#if (YMOT_PORT_OUT != XMOT_PORT_OUT) || (YMOT_BIT != XMOT_BIT)
+        YMOT_PORT_OUT &= ~YMOT_BIT;
+#endif
+#if (ZMOT_PORT_OUT != YMOT_PORT_OUT) || (ZMOT_BIT != YMOT_BIT)
+        ZMOT_PORT_OUT &= ~ZMOT_BIT;
+#endif
+        __delay_cycles(5000); // allow motors to settle
+    } else {
+        XMOT_PORT_OUT |= XMOT_BIT;
+#if (YMOT_PORT_OUT != XMOT_PORT_OUT) || (YMOT_BIT != XMOT_BIT)
+        YMOT_PORT_OUT |= YMOT_BIT;
+#endif
+#if (ZMOT_PORT_OUT != YMOT_PORT_OUT) || (ZMOT_BIT != YMOT_BIT)
+        ZMOT_PORT_OUT |= ZMOT_BIT;
+#endif
+    }
+#endif
 }
 
-void toggleXDir (void) {
-	P2OUT ^= XDIR;		// toggle X direction
+void stopAll (void)
+{
+    XSTEP_CTL &= ~MC0;     		                        // Stop X step timer,
+	YSTEP_CTL &= ~MC0;     		                        // YZ step timer and
+	xAxis.busy = yAxis.busy = zAxis.busy = State_Idle;	// set all axes to idle
+}
+
+void toggleXDir (void)
+{
+    XDIR_PORT_OUT ^= XDIR_BIT;
 	xAxis.cComp = xAxis.bComp;
+	xAxis.dir = !xAxis.dir;
 }
 
-void homeAll (void) {
+void homeAll (void)
+{
 	homeX();
 	homeY();
+#ifdef HAS_FOCUS
 	homeZ();
+#endif
 }
 
-static void homeXseq (const int16_t reverse, const int16_t forward) {
-
+static void homeXseq (const int16_t reverse, const int16_t forward)
+{
 	homeFlags |= XHOMEFLAG;
 
 	moveX(reverse);
@@ -198,11 +303,10 @@ static void homeXseq (const int16_t reverse, const int16_t forward) {
 	homeFlags &= ~XHOMEFLAG;
 
 	moveX(forward);
-
 }
 
-static void homeYseq (const int16_t reverse, const int16_t forward) {
-
+static void homeYseq (const int16_t reverse, const int16_t forward)
+{
 	homeFlags |= YHOMEFLAG;
 
 	moveY(reverse);
@@ -210,273 +314,291 @@ static void homeYseq (const int16_t reverse, const int16_t forward) {
 	homeFlags &= ~YHOMEFLAG;
 
 	moveY(forward);
-
 }
 
-void homeX (void) {
+void homeX (void)
+{
+    enableMotors(true);
 
 	xAxis.bComp = 0;
 
-	if(P1IN & XHOME) 	// already home
-		moveX(500);  	// so move out a bit
 
-	TA0CTL &= ~(ID0|ID1);
-	TA0CTL |= ID0;
+	if(XHOME_PORT_IN & XHOME_BIT) 	// already home
+		moveX(150);  	            // so move out a bit
+
+	XSTEP_CTL &= ~(ID0|ID1);
+	XSTEP_CTL |= ID0;
 	homeXseq(-15000, 100);
 
-	TA0CTL |= ID1;
+	XSTEP_CTL |= ID1;
 	homeXseq(-300, 50);
 	homeXseq(-300, xAxis.homeOffset);
 
-	TA0CTL &= ~(ID0|ID1);
+	XSTEP_CTL &= ~(ID0|ID1);
 	xAxis.position = 0;
-
 }
 
-void homeY (void) {
+void homeY (void)
+{
+    enableMotors(true);
 
-	yAxis.bComp = 0;
+    yAxis.bComp = 0;
 
-	TA1CTL |= ID0;
+	YSTEP_CTL |= ID0;
 
-	if(P2IN & YHOME) 	// already home
-		moveY(500);  	// so move out a bit
+	if(YHOME_PORT_IN & YHOME_BIT) 	// already home
+		moveY(150);  	            // so move out a bit
 
 	homeYseq(-15000, 100);
 
-	TA1CTL &= ~ID0;
-	TA1CTL |= ID1;
+	YSTEP_CTL &= ~ID0;
+	YSTEP_CTL |= ID1;
 	homeYseq(-300, 50);
 	homeYseq(-300, yAxis.homeOffset);
 
-	TA1CTL &= ~ID1;
+	YSTEP_CTL &= ~ID1;
 	yAxis.position = 0;
-
 }
 
-void homeZ (void) {
+void homeZ (void)
+{
+#ifdef HAS_FOCUS
+    enableMotors(true);
 
-	if(P2IN & ZHOME) 	// already home
-		moveZ(100);  	// so move out a bit
+    if(ZHOME_PORT_IN & ZHOME_BIT) 	// already home
+		moveZ(100);  	            // so move out a bit
 
 	homeFlags |= ZHOMEFLAG;
 
 	moveZ(-30000);
 
 	homeFlags &= ~ZHOMEFLAG;
-
+#endif
 	zAxis.position = 0;
-
 }
 
-void stopX (void) {
-	TA0CTL &= ~MC0;     // stop timer 0 and
-	xAxis.busy = STATE_IDLE;
+void stopX (void)
+{
+	XSTEP_CTL &= ~MC0;          // Stop X step timer 0 and
+	xAxis.busy = State_Idle;    // and set state IDLE
 }
 
-void startX (void) {
-
-	xAxis.busy = xAxis.rampSteps ? STATE_ACCEL : STATE_MOVE;
+void startX (void)
+{
+    xAxis.cStppx = xAxis.stppx;
+	xAxis.busy = xAxis.rampSteps ? State_Accel : (xAxis.fsSteps == 1 ? State_Decel : State_Move);
 
 	rampCounter = xAxis.rampSteps;
 	fspCounter = xAxis.fsSteps;
-	TA0CCR0 = *xAxis.profile;
-	TA0CCTL0 = CCIE;                           // Enable CCR0 interrupt|
-	TA0CTL |= MC0;                             // Start TA0 in up mode
+	XSTEP_CCR0 = *xAxis.profile;
+	XSTEP_CCTL0 = CCIE;             // Enable X step timer interrupt
+	XSTEP_CTL |= MC0;               // and start timer in up mode
 }
 
-bool moveX (const int16_t steps) {
-
-	if(steps == 0 || P3IN & ESTOP)
+bool moveX (const int16_t steps)
+{
+	if(steps == 0 || (ESTOP_PORT_IN & ESTOP_BIT))
 		return false;
 
-	if(steps > 0)
-		P2OUT |= XDIR;
-	else
-		P2OUT &= ~XDIR;
-
-	calcParams(steps, &xAxis);
+    calcParams(steps, &xAxis);
 
 	startX();
 
 	while(xAxis.busy) {
 		LPM0;
-		if((homeFlags & XHOMEFLAG) && (P1IN & XHOME)) {
-			TA0CTL &= ~MC0;     // stop timer 0 and
-			xAxis.busy = 0;
+		if((homeFlags & XHOMEFLAG) && (XHOME_PORT_IN & XHOME_BIT)) {
+			XSTEP_CTL &= ~MC0;     // Stop X step timer 0
+			xAxis.busy = State_Idle;
 		}
 	}
 
-	return (P3IN & ESTOP) == 0;
-
+	return (ESTOP_PORT_IN & ESTOP_BIT) == 0;
 }
 
-void startYZ (const int16_t steps, struct axis *axis) {
-
+static void startYZ (const int16_t steps, struct axis *axis)
+{
 	yzAxis = axis;
 
 	calcParams(steps, yzAxis);
 
-	if(steps > 0)
-		P3OUT &= ~(axis->dirBit);
-	else
-		P3OUT |= axis->dirBit;
-
-	yzAxis->busy = yzAxis->rampSteps ? STATE_ACCEL : STATE_MOVE;
+    yzAxis->cStppx = yzAxis->stppx;
+	yzAxis->busy = yzAxis->rampSteps ? State_Accel : (yzAxis->fsSteps == 1 ? State_Decel : State_Move);
 
 	rampCounter = yzAxis->rampSteps;
 	fspCounter = yzAxis->fsSteps;
 
-	TA1CCR0 = *(yzAxis->profile);
-	TA1CCTL0 = CCIE;                           // Enable CCR0 interrupt|
-	TA1CTL |= MC0|ID0;                         // Start TA0 in up mode
+	YSTEP_CCR0 = *(yzAxis->profile);
+	YSTEP_CCTL0 = CCIE;                           // Enable Y step timer interrupt
+	YSTEP_CTL |= MC0|ID0;                         // and start timer in up mode
 }
 
-bool moveY (const int16_t steps) {
-
-	if(steps == 0 || P3IN & ESTOP)
+bool moveY (const int16_t steps)
+{
+	if(steps == 0 || (ESTOP_PORT_IN & ESTOP_BIT))
 		return false;
 
-	P2SEL &= ~ZSTEP;
-	P2SEL |= YSTEP;
+#ifdef HAS_FOCUS
+	YSTEP_PORT_SEL &= ~ZSTEP_BIT;
+	YSTEP_PORT_SEL |= YSTEP_BIT;
+#endif
 
 	startYZ(steps, &yAxis);
 
 	while(yzAxis->busy) {
 		LPM0;
-		if((homeFlags & YHOMEFLAG) && (P2IN & YHOME)) {
-			TA1CTL &= ~MC0;     // stop timer 0 and
-			yzAxis->busy = 0;
+		if((homeFlags & YHOMEFLAG) && (YHOME_PORT_IN & YHOME_BIT)) {
+			YSTEP_CTL &= ~MC0;     // Stop Y step timer 0
+			yzAxis->busy = State_Idle;
 		}
 	}
 
-	return (P3IN & ESTOP) == 0;
-
+	return (ESTOP_PORT_IN & ESTOP_BIT) == 0;
 }
 
-bool moveZ (const int16_t steps) {
-
-	if(steps == 0 || P3IN & ESTOP)
+bool moveZ (const int16_t steps)
+{
+#ifdef HAS_FOCUS
+	if(steps == 0 || (ESTOP_PORT_IN & ESTOP_BIT))
 		return false;
 
-	P2SEL &= ~YSTEP;
-	P2SEL |= ZSTEP;
+#ifndef __MSP430F5310__
+	ZSTEP_PORT_SEL  &= ~YSTEP_BIT;
+	ZSTEP_PORT_SEL  |= ZSTEP_BIT;
+#endif
 
 	startYZ(steps, &zAxis);
 
 	while(yzAxis->busy) {
 		LPM0;
-		if((homeFlags & ZHOMEFLAG) && (P2IN & ZHOME)) {
-			yzAxis->busy = 0;
-			TA1CTL &= ~MC0;     // stop timer 0 and
+		if((homeFlags & ZHOMEFLAG) && (ZHOME_PORT_IN & ZHOME_BIT)) {
+			yzAxis->busy = State_Idle;
+			YSTEP_CTL &= ~MC0;     // Stop Y step timer 0
 		}
 	}
 
-	return (P3IN & ESTOP) == 0;
-
+	return (ESTOP_PORT_IN & ESTOP_BIT) == 0;
+#else
+	return false;
+#endif
 }
 
 // CCR0 Interrupt service routine - handles X-axis movement
 
-#pragma vector=TIMER0_A0_VECTOR
-__interrupt void CCR0_ISR(void)
+#pragma vector=XSTEP_IRQH
+//TIMER0_A0_VECTOR
+__interrupt void XSTEP_ISR(void)
 {
-
-	if(P3IN & ESTOP)
-		xAxis.busy = STATE_IDLE;
-
+	if(ESTOP_PORT_IN & ESTOP_BIT)
+		xAxis.busy = State_Idle;
+#if	XSTPPIXELS > 1
+	else if(--xAxis.cStppx == 0 && !xAxis.cComp) {
+#else
 	else if(!xAxis.cComp) {
-
+#endif
 		switch(xAxis.busy) {
 
-			case STATE_ACCEL:
+			case State_Accel:
 				if(--rampCounter) {
-					TA0CCR0 = *(++xAxis.profile);
+					XSTEP_CCR0 = *(++xAxis.profile); // Update timer timeout
 				} else {
-					xAxis.busy = fspCounter == 0 ? STATE_DECEL : STATE_MOVE;
+					xAxis.busy = fspCounter == 0 ? State_Decel : State_Move;
 					rampCounter = xAxis.rampSteps;
 				}
 				break;
 
-			case STATE_MOVE:
+			case State_Move:
 				if(!(--fspCounter))
-					xAxis.busy = STATE_DECEL;
+					xAxis.busy = State_Decel;
 				break;
 
-			case STATE_DECEL:
+			case State_Decel:
 				if(rampCounter && --rampCounter)
-					TA0CCR0 = *(--xAxis.profile);
+					XSTEP_CCR0 = *(--xAxis.profile); // Update timer timeout
 				else
-					xAxis.busy = STATE_IDLE;
+					xAxis.busy = State_Idle;
 				break;
 
 		}
 
-		if(P2OUT & XDIR)
-			xAxis.position++;
-		else
-			xAxis.position--;
-
+        if(xAxis.dir)
+            xAxis.position++;
+        else
+            xAxis.position--;
 	}
 
 	if(!xAxis.busy)	{		// If task completed (or ESTOP)
-		TA0CTL &= ~MC0;		// stop timer 0
+		XSTEP_CTL &= ~MC0;  // stop X step timer
 		xAxis.cComp = 0;	// and clear backlash counter
 	}
-
-	if(xAxis.cComp)
-		xAxis.cComp--;
-	else
-		LPM0_EXIT;        	// Exit LPM0
-
+#if XSTPPIXELS > 1
+    if(!xAxis.cStppx) {
+        xAxis.cStppx = xAxis.stppx;
+        if(xAxis.cComp)
+            xAxis.cComp--;
+        else
+            LPM0_EXIT;        	// Exit LPM0
+    }
+#else
+    if(xAxis.cComp)
+        xAxis.cComp--;
+    else
+        LPM0_EXIT;          // Exit LPM0
+#endif
 }
 
 // CCR1 Interrupt service routine - handles Y & Z-axis movement
 
-#pragma vector=TIMER1_A0_VECTOR
-__interrupt void CCR1_ISR(void)
+#pragma vector=YSTEP_IRQH
+//TIMER1_A0_VECTOR
+__interrupt void YZSTEP_ISR(void)
 {
+	if(ESTOP_PORT_IN & ESTOP_BIT)
+		yzAxis->busy = State_Idle;
+#if YSTPPIXELS > 1
+    else if(--yzAxis->cStppx == 0) {
+#else
+    else {
+#endif
+	    switch(yzAxis->busy) {
 
-	if(P3IN & ESTOP) {
-		yzAxis->busy = STATE_IDLE;
-
-	} else {
-
-		switch(yzAxis->busy) {
-
-			case STATE_ACCEL:
+			case State_Accel:
 				if(--rampCounter) {
-					TA1CCR0 = *(++(yzAxis->profile));
+					YSTEP_CCR0 = *(++(yzAxis->profile)); // Update timer timeout
 				} else {
-					yzAxis->busy = fspCounter == 0 ? STATE_DECEL : STATE_MOVE;
+					yzAxis->busy = fspCounter == 0 ? State_Decel : State_Move;
 					rampCounter = yzAxis->rampSteps;
 				}
 				break;
 
-			case STATE_MOVE:
+			case State_Move:
 				if(!(--fspCounter))
-					yzAxis->busy = STATE_DECEL;
+					yzAxis->busy = State_Decel;
 				break;
 
-			case STATE_DECEL:
+			case State_Decel:
 				if(rampCounter && --rampCounter)
-					TA1CCR0 = *(--(yzAxis->profile));
+					YSTEP_CCR0 = *(--(yzAxis->profile)); // Update timer timeout
 				else
-					yzAxis->busy = STATE_IDLE;
+					yzAxis->busy = State_Idle;
 				break;
 
 		}
 
-		if(P3OUT & yzAxis->dirBit)
-			yzAxis->position--;
-		else
+		if(yzAxis->dir)
 			yzAxis->position++;
-
+		else
+			yzAxis->position--;
 	}
 
 	if(!yzAxis->busy)		// If task completed (or ESTOP)
-		TA1CTL &= ~MC0;     // stop timer 1 and
+		YSTEP_CTL &= ~MC0;  // stop Y step timer
 
-	LPM0_EXIT;				// Exit LPM0
-
+#if YSTPPIXELS > 1
+	 if(!yzAxis->cStppx) {
+	    yzAxis->cStppx = yzAxis->stppx;
+        LPM0_EXIT;				// Exit LPM0
+	 }
+#else
+     LPM0_EXIT;              // Exit LPM0
+#endif
 }
